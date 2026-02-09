@@ -16,7 +16,8 @@ from deepspeed import DeepSpeedEngine
 from deepspeed.runtime.utils import see_memory_usage
 from tqdm import trange
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
-from vllm import LLM, CompletionOutput, RequestOutput, SamplingParams
+from vllm import LLM, CompletionOutput, RequestOutput, SamplingParams, TokensPrompt
+
 
 import wandb
 from utils import (
@@ -28,9 +29,12 @@ from utils import (
     find_last_checkpoint,
     fix_oov_logits_processor,
     initialize_training_process_group,
-    load_model_into_vllm,
+    # load_model_into_vllm,
+    ensure_master_addr_port,
+    move_model_to_vllm,
     prepare_model_inputs,
 )
+from math_equivalence import extract_boxed_answer
 
 os.environ["VLLM_USE_V1"] = "0"
 
@@ -55,27 +59,30 @@ arg_parser.add_argument("--algorithm", type=str, choices=["grpo", "vineppo"], de
 arg_parser.add_argument("--vineppo_k", type=int, default=3, help="Number of MC samples to take for each response")
 arg_parser.add_argument("--run_id", type=str, default=None, help="Run ID")
 arg_parser.add_argument("--nproc", type=int, default=1, help="Number of processes (data parallelism) to use")
-
+arg_parser.add_argument("--run_dir", type=str, default=None, help="Base directory for run artifacts")
+arg_parser.add_argument("--save_steps", type=int, default=50, help="Save frequency in steps")
+arg_parser.add_argument("--test_freq", type=int, default=25, help="Test frequency in steps")
 
 # Load and process dataset
 def preprocess_example(
     example: Dict[str, Any],
     tokenizer: AutoTokenizer,
-    SYSTEM_MESSAGE: str,
-    PROMPT_TEMPLATE: str,
+    # SYSTEM_MESSAGE: str,
+    # PROMPT_TEMPLATE: str,
 ):
-    numbers: List[int] = example["nums"]
-    target: int = example["target"]
+    # numbers: List[int] = example["nums"]
+    # target: int = example["target"]
 
-    prefix = [
-        {"role": "system", "content": SYSTEM_MESSAGE},
-        {
-            "role": "user",
-            "content": PROMPT_TEMPLATE.format(numbers=numbers, target=target),
-        },
-        {"role": "assistant", "content": "Let me solve this step by step.\n<think>"},
-    ]
-    input_ids = tokenizer.apply_chat_template(prefix, tokenize=True, continue_final_message=True)
+    # prefix = [
+    #     {"role": "system", "content": SYSTEM_MESSAGE},
+    #     {
+    #         "role": "user",
+    #         "content": PROMPT_TEMPLATE.format(numbers=numbers, target=target),
+    #     },
+    #     {"role": "assistant", "content": "Let me solve this step by step.\n<think>"},
+    # ]
+    prefix = example["prompt"]
+    input_ids = tokenizer.apply_chat_template(prefix, tokenize=True, add_generation_prompt=True)
     prompt = tokenizer.decode(input_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
     return {"prompt": prompt, "input_ids": input_ids}
 
@@ -132,41 +139,44 @@ def format_reward_func(completion: str, EOS_TOKEN: str) -> float:
         return 0.0
 
 
-def equation_reward_func(completion: str, nums: List[int], target: int) -> float:
+def equation_reward_func(completion: str, target: int) -> float:
     """
     Evaluates completion based on mathematical correctness of the answer
 
     Args:
         completion (str): Generated output
-        target (str): Expected answer
-        nums (list): Available numbers to use in the equation
+        target (int): Expected answer
 
     Returns:
         float: Reward score
     """
     try:
         # add synthetic <think> as its already part of the prompt and prefilled for the assistant to more easily match the regex
-        completion = "<think>" + completion
+        # completion = "<think>" + completion
         # Check if the format is correct
-        match = re.search(r"<answer>(.*?)<\/answer>", completion)
-        if match is None:
-            return 0.0
+        # match = re.search(r"<answer>(.*?)<\/answer>", completion)
+        # if match is None:
+            # return 0.0
         # Extract the "answer" part from the completion
-        equation = match.group(1).strip()
+        # equation = match.group(1).strip()
         # Extract all numbers from the equation
-        used_numbers = [int(n) for n in re.findall(r"\d+", equation)]
+        # used_numbers = [int(n) for n in re.findall(r"\d+", equation)]
 
-        # Check if all numbers are used exactly once
-        if sorted(used_numbers) != sorted(nums):
-            return 0.0
-        # Define a regex pattern that only allows numbers, operators, parentheses, and whitespace
-        allowed_pattern = r"^[\d+\-*/().\s]+$"
-        if not re.match(allowed_pattern, equation):
-            return 0.0
+        predicted_answer = extract_boxed_answer(completion)
+        # Convert predicted answer to int
+        result = int(predicted_answer)
 
-        # Evaluate the equation with restricted globals and locals
-        result = eval(equation, {"__builtins__": None}, {})
-        # Check if the equation is correct and matches the ground truth
+        # # Check if all numbers are used exactly once
+        # if sorted(used_numbers) != sorted(nums):
+        #     return 0.0
+        # # Define a regex pattern that only allows numbers, operators, parentheses, and whitespace
+        # allowed_pattern = r"^[\d+\-*/().\s]+$"
+        # if not re.match(allowed_pattern, equation):
+        #     return 0.0
+
+        # # Evaluate the equation with restricted globals and locals
+        # result = eval(equation, {"__builtins__": None}, {})
+        # # Check if the equation is correct and matches the ground truth
         if abs(float(result) - float(target)) < 1e-5:
             return 1.0
         else:
@@ -177,16 +187,15 @@ def equation_reward_func(completion: str, nums: List[int], target: int) -> float
 
 
 def compute_reward(completion: str, sample: Dict[str, Any], EOS_TOKEN: str) -> Tuple[float, Dict[str, float]]:
-    nums = sample["nums"]
-    target = sample["target"]
+    target = sample["reward_model"]["ground_truth"]
 
-    format_reward = format_reward_func(completion, EOS_TOKEN)
-    equation_reward = equation_reward_func(completion=completion, nums=nums, target=target)
+    # format_reward = format_reward_func(completion, EOS_TOKEN)
+    equation_reward = equation_reward_func(completion=completion, target=target)
 
-    reward = format_reward + equation_reward
+    reward = equation_reward
 
     metrics = {
-        "format_reward": format_reward,
+        # "format_reward": format_reward,
         "equation_reward": equation_reward,
     }
 
@@ -665,6 +674,7 @@ def main(rank: int):
 
     # Model configuration
     MODEL_NAME = args.model_name
+    ENABLE_SLEEP_MODE = True
 
     # RL parameters
     # Total number of training iterations
@@ -729,7 +739,10 @@ def main(rank: int):
         RUN_NAME = f"{model_name_short}_temp{TEMPERATURE}_kl{KL_COEFFICIENT}_lr{LEARNING_RATE}_al{args.algorithm}"
     else:
         RUN_NAME = args.run_id
-    EXP_DIR = Path.home() / "scratch" / "nano_aha_moment" / RUN_NAME
+    if args.run_dir:
+        EXP_DIR = Path(args.run_dir) / RUN_NAME
+    else:
+        raise ValueError("args.run_dir must be specified.")
     EXP_DIR.mkdir(parents=True, exist_ok=True)
 
     logger.info(f"Logs and Checkpoints will be saved to: {EXP_DIR}")
@@ -753,7 +766,8 @@ def main(rank: int):
     EOS_TOKEN_ID = tokenizer.eos_token_id
     EOS_TOKEN = tokenizer.convert_ids_to_tokens(EOS_TOKEN_ID)
 
-    dataset = load_dataset("Jiayi-Pan/Countdown-Tasks-3to4", split="train")
+    # dataset = load_dataset("Jiayi-Pan/Countdown-Tasks-3to4", split="train")
+    dataset = load_dataset("parquet", data_files="/scratch1/hnn5071/workspace/rm-limeval/datasets/data/train/mw_pathstar_2_7/train_rl.parquet")['train']
     # Rank 0 will preprocess the dataset first
     if dist.get_rank() != 0:
         # Other ranks will wait for rank 0 to enter the barrier
@@ -763,8 +777,8 @@ def main(rank: int):
         num_proc=6,
         fn_kwargs={
             "tokenizer": tokenizer,
-            "SYSTEM_MESSAGE": SYSTEM_MESSAGE,
-            "PROMPT_TEMPLATE": PROMPT_TEMPLATE,
+            # "SYSTEM_MESSAGE": SYSTEM_MESSAGE,
+            # "PROMPT_TEMPLATE": PROMPT_TEMPLATE,
         },
         desc="Preprocessing dataset",
     )
@@ -774,7 +788,7 @@ def main(rank: int):
     dist.barrier(device_ids=[torch.cuda.current_device()])
 
     # Split dataset
-    train_test_split = dataset.train_test_split(test_size=500, seed=42)
+    train_test_split = dataset.train_test_split(test_size=5, seed=42)
     train_dataset = train_test_split["train"]
     orig_train_dataset_size = len(train_dataset)
     test_dataset = train_test_split["test"]
@@ -830,6 +844,13 @@ def main(rank: int):
         vllm_logger = logging.getLogger("vllm")
         vllm_logger.setLevel(logging.ERROR)
 
+    print("Rank: ", dist.get_rank(), "Current device: ", torch.cuda.current_device())
+    # vLLM requires the environment variables to be set for distributed training.
+    os.environ["RANK"] = str(dist.get_rank())
+    os.environ["LOCAL_RANK"] = str(dist.get_rank())
+    os.environ["WORLD_SIZE"] = str(dist.get_world_size())
+    ensure_master_addr_port()
+    
     inference_engine = LLM(
         model=MODEL_NAME,
         skip_tokenizer_init=False,
@@ -838,11 +859,35 @@ def main(rank: int):
         swap_space=4,
         scheduling_policy="fcfs",
         dtype=torch.bfloat16,
-        max_model_len=MAX_RESPONSE_TOKENS + 1024,
-        enable_sleep_mode=True,
-        device=f"cuda:{torch.cuda.current_device()}",
+        max_model_len=MAX_RESPONSE_TOKENS + 512,
+        # device=f"cuda:{torch.cuda.current_device()}",
         tensor_parallel_size=1,
+
+        distributed_executor_backend="external_launcher",
+        seed=dist.get_rank() // 1,
+        # Latest vLLM v1 memory profiler is misled by the high default value (i.e., 32768) - thinking there's not enough memory
+        max_num_batched_tokens=4096,
+        enable_sleep_mode=ENABLE_SLEEP_MODE,
+        # Important so temperature scaling/logit tweaking affects the TIS log probs
+        logprobs_mode="processed_logprobs",
     )
+    generation_kwargs = {
+        "n": GENERATIONS_PER_SAMPLE,
+        "repetition_penalty": 1.0,
+        "temperature": TEMPERATURE,
+        "top_p": TOP_P,
+        "top_k": TOP_K,
+        "min_p": 0.0,
+        "max_tokens": MAX_RESPONSE_TOKENS,
+        "logprobs": 0,  # enable returning log probabilities; 0 means for the sampled tokens only
+        "detokenize": False,
+        "stop_token_ids": [EOS_TOKEN_ID],
+        "logits_processors": logits_processors,
+    }
+    sampling_params = SamplingParams(**generation_kwargs)
+    
+    # inference_engine.sleep(level=2)
+
     if args.algorithm == "vineppo":
         logits_processors = [fix_oov_logits_processor(inference_engine)]
     else:
@@ -853,7 +898,7 @@ def main(rank: int):
     # Wandb for logging. Only rank 0 will initialize wandb
     if dist.get_rank() == 0:
         wandb.init(
-            project="nano-aha-moment",
+            project="RLVR-pathstar",
             name=RUN_NAME,
             resume="allow",
             config={
@@ -875,20 +920,35 @@ def main(rank: int):
     # Load checkpoint if it exists
     begin_iter = 0
     ckpt_path, ckpt_iter = find_last_checkpoint(EXP_DIR)
+    zero_stage_3 = deepspeed_config["zero_optimization"]["stage"] == 3
     if ckpt_path is not None:
         logger.info(f"Resuming from checkpoint {ckpt_path} at iteration {ckpt_iter}")
         out = policy_model.load_checkpoint(ckpt_path / "deepspeed")
         if out is None:
             raise RuntimeError(f"Failed to load checkpoint {ckpt_path}")
         begin_iter = ckpt_iter + 1
-        load_model_into_vllm(policy_model, inference_engine)
+
+        move_model_to_vllm(policy_model.module, inference_engine, zero_stage_3=zero_stage_3)
 
         logger.info(f"Skipping {ckpt_iter} rounds of samples")
         for _ in trange(ckpt_iter, disable=dist.get_rank() != 0):
             _ = sampler_rng.choice(len(train_dataset), size=NUM_SAMPLES_PER_ITERATION, replace=False)
 
+    last_loaded_iter = begin_iter
     for iteration in trange(begin_iter, NUM_ITERATIONS):
         logger.info(f"Iteration {iteration}/{NUM_ITERATIONS}")
+
+        if ENABLE_SLEEP_MODE:
+            torch.cuda.empty_cache()
+            inference_engine.wake_up(tags=['weights'])
+            inference_engine.collective_rpc("reload_weights")
+        
+        if last_loaded_iter != iteration:
+            move_model_to_vllm(policy_model.module, inference_engine, zero_stage_3=zero_stage_3)
+            last_loaded_iter = iteration
+        
+        if ENABLE_SLEEP_MODE:
+            inference_engine.wake_up(tags=['kv_cache'])
 
         metrics = {}
 
@@ -897,7 +957,7 @@ def main(rank: int):
         #########################################################
 
         eval_stats = None
-        if iteration % 25 == 0 and iteration > 0 and dist.get_rank() == 0:  # Only rank 0 will evaluate:
+        if iteration % args.test_freq == 0 and dist.get_rank() == 0:  # Only rank 0 will evaluate:
             logger.info("Evaluating on eval set...")
             eval_episodes, eval_stats = evaluate_on_test_set(
                 inference_engine=inference_engine,
@@ -932,21 +992,14 @@ def main(rank: int):
         indices = sampler_rng.choice(len(train_dataset), size=NUM_SAMPLES_PER_ITERATION, replace=False)
         samples = train_dataset.select(indices)
 
-        gen_time = time.time()
+        # Create a TokenPrompt object or dictionary
+        formatted_inputs = [TokensPrompt(prompt_token_ids=samples["input_ids"][i]) for i in range(len(samples))]
 
+        gen_time = time.time()
         # Sample responses
         outputs = inference_engine.generate(
-            prompt_token_ids=samples["input_ids"],
-            sampling_params=SamplingParams(
-                n=GENERATIONS_PER_SAMPLE,
-                temperature=TEMPERATURE,
-                top_p=TOP_P,
-                top_k=TOP_K,
-                max_tokens=MAX_RESPONSE_TOKENS,
-                detokenize=False,
-                stop_token_ids=[EOS_TOKEN_ID],
-                logits_processors=logits_processors,
-            ),
+            formatted_inputs,
+            sampling_params=sampling_params,
         )
         all_generations = [list(g.token_ids) for out in outputs for g in out.outputs]
         all_finish_reasons = [g.finish_reason for out in outputs for g in out.outputs]
@@ -983,7 +1036,8 @@ def main(rank: int):
         else:
             raise ValueError(f"Invalid algorithm: {args.algorithm}")
 
-        inference_engine.sleep(1)
+        if ENABLE_SLEEP_MODE:
+            inference_engine.sleep(level=2)
         gc.collect()
         torch.cuda.empty_cache()
         time.sleep(1)
@@ -1093,8 +1147,8 @@ def main(rank: int):
         torch.cuda.empty_cache()
         time.sleep(1)
 
-        inference_engine.wake_up()
-        load_model_into_vllm(policy_model, inference_engine)
+        # inference_engine.wake_up()
+        # load_model_into_vllm(policy_model, inference_engine)
 
         #########################################################
         # Log metrics
@@ -1105,7 +1159,7 @@ def main(rank: int):
             train_metrics["learning_rate"] = policy_model.get_lr()[0]
             logs = {
                 "iteration": iteration,
-                f"episodes/iter_{iteration:06d}": episode_table,
+                f"train/episodes": episode_table,
                 **{f"train/{k}": v for k, v in train_metrics.items()},
             }
             if eval_stats is not None:
@@ -1125,7 +1179,7 @@ def main(rank: int):
             selected_metrics = {k: float(logs[k]) for k in selected_keys if k in logs}
             logger.info(f"KEY METRICS: {selected_metrics}")
 
-        if iteration % 50 == 0 and iteration != 0:
+        if iteration % args.save_steps == 0 and iteration != 0:
             ckpt_dir = EXP_DIR / "checkpoints" / f"ckpt_{iteration:06d}"
 
             logger.info("Saving HF model")
@@ -1140,13 +1194,12 @@ def main(rank: int):
             if dist.get_rank() == 0:
                 clean_up_checkpoints(
                     exp_dir=EXP_DIR,
-                    keep_every_n_steps=50,
+                    keep_every_n_steps=args.save_steps,
                     exclude=[ckpt_dir],
                 )
             dist.barrier(device_ids=[torch.cuda.current_device()])
 
     dist.destroy_process_group()
-
 
 if __name__ == "__main__":
     args = arg_parser.parse_args()

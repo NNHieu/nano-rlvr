@@ -12,7 +12,9 @@ import wandb
 from datasets import Dataset
 from deepspeed import DeepSpeedEngine
 from transformers import AutoTokenizer, PreTrainedModel
-from vllm import LLM, SamplingParams
+from vllm import LLM, SamplingParams, TokensPrompt
+
+from contextlib import nullcontext
 
 DEFAULT_SYSTEM_MESSAGE = "You are a helpful assistant. You first think about the reasoning process in the mind and then provide the user with the answer."
 DEFAULT_PROMPT_TEMPLATE = "Using the numbers {numbers}, create an equation that equals {target}. You can use basic arithmetic operations (+, -, *, /) and each number can only be used once. Show your work in <think> </think> tags. And return the final equation and answer in <answer> </answer> tags, for example <answer>(1 + 2) / (3 * 5)</answer>."
@@ -113,8 +115,8 @@ def prepare_model_inputs(
     }
 
 
-@torch.compile(dynamic=True)
-def log_softmax_and_gather(logits: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+# @torch.compile(dynamic=True)
+def log_softmax_and_gather(logits: torch.Tensor, index: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
     """
     Copied from https://github.com/allenai/open-instruct/blob/main/open_instruct/model_utils.py#L425
 
@@ -133,7 +135,7 @@ def log_softmax_and_gather(logits: torch.Tensor, index: torch.Tensor) -> torch.T
 
     See https://github.com/allenai/open-instruct/pull/584
     """
-    logprobs = logits.log_softmax(dim=-1)
+    logprobs = (logits / temperature).log_softmax(dim=-1)
     return torch.gather(logprobs, dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
 
 
@@ -185,16 +187,16 @@ def compute_token_log_probs(
         use_cache=False,
     )
 
-    logits = outputs.logits / temperature  # Shape: [batch_size, seq_len, vocab_size]
-    shift_logits = logits[..., :-1, :]  # Shape: [batch_size, seq_len-1, vocab_size]
-    shift_labels = inputs["labels"][..., 1:]  # Shape: [batch_size, seq_len-1]
+    # logits = outputs.logits / temperature  # Shape: [batch_size, seq_len, vocab_size]
+    shift_logits = outputs.logits[..., :-1, :]  # Shape: [batch_size, seq_len-1, vocab_size]
+    shift_labels = inputs["labels"][..., 1:].clone()  # Shape: [batch_size, seq_len-1]
     shift_labels_mask = inputs["labels_mask"][..., 1:]  # Shape: [batch_size, seq_len-1]
 
     # Create mask for valid labels
     shift_labels[~(shift_labels_mask.bool())] = 0  # Shape: [batch_size, seq_len-1]
 
     # Calculate log probabilities
-    log_probs = log_softmax_and_gather(shift_logits, shift_labels)  # Shape: [batch_size, seq_len-1]
+    log_probs = log_softmax_and_gather(shift_logits, shift_labels, temperature)  # Shape: [batch_size, seq_len-1]
     log_probs = log_probs * shift_labels_mask  # Shape: [batch_size, seq_len-1]
 
     return log_probs
@@ -251,8 +253,12 @@ def evaluate_on_test_set(
         ... )
         >>> print(f"Average reward: {episodes_stats['rewards']:.3f}")
     """
+    
+
+    # Create a TokenPrompt object or dictionary
+    formatted_inputs = [TokensPrompt(prompt_token_ids=test_dataset["input_ids"][i]) for i in range(len(test_dataset))]
     generations = inference_engine.generate(
-        prompt_token_ids=test_dataset["input_ids"], sampling_params=eval_sampling_params
+        formatted_inputs, sampling_params=eval_sampling_params
     )
 
     metrics = {
@@ -519,3 +525,64 @@ def close_to_zero(tensor: torch.Tensor, mask: torch.Tensor, threshold: float = 1
     close_to_zero_mask = torch.abs(tensor) < threshold
     num_close_to_zero = (close_to_zero_mask * mask).sum()
     return num_close_to_zero
+
+def _fix_param_name_to_vllm(name, extra_prefixes: list[str] | None = None):
+    extra_prefixes = extra_prefixes or []
+    prefixes = ["_checkpoint_wrapped_module."] + extra_prefixes
+    for prefix in prefixes:
+        name = name.replace(prefix, "")
+    return name
+
+def move_model_to_vllm(model, llm: LLM, zero_stage_3: bool = False):
+    if zero_stage_3:
+        import deepspeed
+        gather_if_zero3 = deepspeed.zero.GatheredParameters
+    else:
+        gather_if_zero3 = nullcontext
+
+    llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
+    for name, param in model.named_parameters():
+        name = _fix_param_name_to_vllm(name)
+        with gather_if_zero3([param]):
+            llm_model.load_weights([(name, param.data)])
+    
+    # Reset cache on vLLM
+    llm.reset_prefix_cache()
+
+def _is_port_free(port: int, host: str = "127.0.0.1") -> bool:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((host, port))
+            return True
+    except OSError:
+        return False
+
+def _find_free_port() -> int:
+    candidates = (29500, 23456, 12355, 12345)
+    for p in candidates:
+        if _is_port_free(p):
+            return p
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1] 
+
+def ensure_master_addr_port(addr: str | None = None, port: int | None = None) -> None:
+    """
+    Ensure `MASTER_ADDR`/`MASTER_PORT` are set safely.
+
+    - Respects existing environment variables.
+    - Defaults `MASTER_ADDR` to localhost if unset.
+    - Chooses a free TCP port if `MASTER_PORT` is unset to avoid collisions.
+    - If `MASTER_PORT` is set to `"0"` or `"auto"`, it is resolved to a free port.
+    """
+    os.environ["MASTER_ADDR"] = os.environ.get("MASTER_ADDR") or addr or "localhost"
+
+    env_port = os.environ.get("MASTER_PORT", "").strip().lower()
+    if port is None and env_port not in {"", "0", "auto"}:
+        try:
+            port = int(env_port)
+        except ValueError:
+            pass
+
+    os.environ["MASTER_PORT"] = str(_find_free_port() if port in (None, 0) else port)
