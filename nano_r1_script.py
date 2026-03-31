@@ -767,7 +767,7 @@ def main(rank: int):
     EOS_TOKEN = tokenizer.convert_ids_to_tokens(EOS_TOKEN_ID)
 
     # dataset = load_dataset("Jiayi-Pan/Countdown-Tasks-3to4", split="train")
-    dataset = load_dataset("parquet", data_files="/scratch1/hnn5071/workspace/rm-limeval/datasets/data/train/mw_pathstar_2_7/train_rl.parquet")['train']
+    dataset = load_dataset("parquet", data_files="./datasets/data/train/mw_pathstar_2_7/train_rl.parquet")['train']
     # Rank 0 will preprocess the dataset first
     if dist.get_rank() != 0:
         # Other ranks will wait for rank 0 to enter the barrier
