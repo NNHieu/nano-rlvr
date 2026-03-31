@@ -1,5 +1,5 @@
 import re
-from math_verify import parse, verify
+# from math_verify import parse, verify
 
 def remove_boxed(s):
     if "\\boxed " in s:
@@ -64,7 +64,7 @@ def extract_code_answer(output, mode='gen'):
     string_in_last_codeoutput = last_code_output_only_string(output)
     return string_in_last_codeoutput if string_in_last_codeoutput is not None else ''
 
-def is_math_equiv(gold, answer, parsing_timeout=1.0):
-    gold = parse(gold)
-    answer = parse(answer, parsing_timeout=parsing_timeout)
-    return verify(gold, answer)
+# def is_math_equiv(gold, answer, parsing_timeout=1.0):
+#     gold = parse(gold)
+#     answer = parse(answer, parsing_timeout=parsing_timeout)
+#     return verify(gold, answer)

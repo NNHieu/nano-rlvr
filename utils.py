@@ -10,11 +10,14 @@ import torch
 import torch.distributed as dist
 import wandb
 from datasets import Dataset
-from deepspeed import DeepSpeedEngine
+# from deepspeed import DeepSpeedEngine
 from transformers import AutoTokenizer, PreTrainedModel
 from vllm import LLM, SamplingParams, TokensPrompt
 
 from contextlib import nullcontext
+
+# Define DeepSpeedEngine as a placeholder for type hinting
+DeepSpeedEngine = Any
 
 DEFAULT_SYSTEM_MESSAGE = "You are a helpful assistant. You first think about the reasoning process in the mind and then provide the user with the answer."
 DEFAULT_PROMPT_TEMPLATE = "Using the numbers {numbers}, create an equation that equals {target}. You can use basic arithmetic operations (+, -, *, /) and each number can only be used once. Show your work in <think> </think> tags. And return the final equation and answer in <answer> </answer> tags, for example <answer>(1 + 2) / (3 * 5)</answer>."
@@ -256,7 +259,15 @@ def evaluate_on_test_set(
     
 
     # Create a TokenPrompt object or dictionary
-    formatted_inputs = [TokensPrompt(prompt_token_ids=test_dataset["input_ids"][i]) for i in range(len(test_dataset))]
+    # formatted_inputs = [TokensPrompt(prompt_token_ids=test_dataset["input_ids"][i]) for i in range(len(test_dataset))]
+    # Wrap each input to ensure it's a list of standard Python ints
+    # print(test_dataset)
+    # print(test_dataset["input_ids"])
+    formatted_inputs = [
+        TokensPrompt(prompt_token_ids=[int(tid) for tid in test_dataset["input_ids"][i]]) 
+        for i in range(len(test_dataset))
+    ]
+
     generations = inference_engine.generate(
         formatted_inputs, sampling_params=eval_sampling_params
     )
@@ -414,7 +425,7 @@ def initialize_training_process_group(rank: int, world_size: int):
         - A timeout of 1800 seconds (30 minutes) is set for process group initialization
     """
     master_addr = "localhost"
-    master_training_port = 8237
+    master_training_port = int(os.environ.get("MASTER_PORT", 8237))
 
     # os.environ["RANK"] = str(rank)
     os.environ["LOCAL_RANK"] = str(rank)
@@ -528,23 +539,41 @@ def close_to_zero(tensor: torch.Tensor, mask: torch.Tensor, threshold: float = 1
 
 def _fix_param_name_to_vllm(name, extra_prefixes: list[str] | None = None):
     extra_prefixes = extra_prefixes or []
-    prefixes = ["_checkpoint_wrapped_module."] + extra_prefixes
+    # Add FSDP wrapper prefix to the strip list
+    prefixes = [
+        "_checkpoint_wrapped_module.", 
+        "_fsdp_wrapped_module."
+    ] + extra_prefixes
+    
     for prefix in prefixes:
         name = name.replace(prefix, "")
     return name
 
-def move_model_to_vllm(model, llm: LLM, zero_stage_3: bool = False):
-    if zero_stage_3:
-        import deepspeed
-        gather_if_zero3 = deepspeed.zero.GatheredParameters
-    else:
-        gather_if_zero3 = nullcontext
+# def move_model_to_vllm(model, llm: LLM, zero_stage_3: bool = False):
+#     if zero_stage_3:
+#         import deepspeed
+#         gather_if_zero3 = deepspeed.zero.GatheredParameters
+#     else:
+#         gather_if_zero3 = nullcontext
 
+#     llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
+#     for name, param in model.named_parameters():
+#         name = _fix_param_name_to_vllm(name)
+#         with gather_if_zero3([param]):
+#             llm_model.load_weights([(name, param.data)])
+    
+#     # Reset cache on vLLM
+#     llm.reset_prefix_cache()
+
+def move_model_to_vllm(model, llm: LLM):
+    # FSDP handles unsharding via the `summon_full_params` context manager
+    # used in your main training loop, so we don't need DeepSpeed gathers here.
     llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
+    
     for name, param in model.named_parameters():
-        name = _fix_param_name_to_vllm(name)
-        with gather_if_zero3([param]):
-            llm_model.load_weights([(name, param.data)])
+        clean_name = _fix_param_name_to_vllm(name)
+        # Load the unsharded data directly into vLLM
+        llm_model.load_weights([(clean_name, param.data)])
     
     # Reset cache on vLLM
     llm.reset_prefix_cache()
